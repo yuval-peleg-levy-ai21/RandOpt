@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-vLLM OpenAI-compatible server extended with /perturb and /restore endpoints
-for seed-based weight perturbation via WorkerExtension.
+vLLM OpenAI-compatible server extended with weight perturbation endpoints
+via WorkerExtension.
 
-  POST /perturb  {"seed": int, "sigma": float, "negate": bool}
-  POST /restore  {"seed": int, "sigma": float, "negate": bool}
+  POST /perturb       {"seed": int, "sigma": float, "negate": bool}
+  POST /restore       {"seed": int, "sigma": float, "negate": bool}
+  POST /store_base    {}   — snapshot current weights as the reset target
+  POST /reset         {}   — restore weights to the last /store_base snapshot
 
-Both endpoints call collective_rpc on all GPU workers and block until done.
+/store_base + /reset is the preferred alternative to /restore: no seed needed,
+always exact (no floating-point add/subtract), safe even if perturbation params
+are not remembered.  Call /store_base once after the server is ready, then use
+/perturb … /reset for each evaluation cycle.
+
 All standard vLLM API server arguments are accepted and forwarded unchanged.
 
 Example:
@@ -64,6 +70,18 @@ def _build_app_with_randopt_routes(args) -> FastAPI:
             args=(body.seed, body.sigma, body.negate),
         )
         return {"status": "ok", "seed": body.seed, "sigma": body.sigma}
+
+    @app.post("/store_base")
+    async def store_base(raw_request: Request):
+        ec = raw_request.app.state.engine_client
+        await ec.collective_rpc("store_base_weights", args=())
+        return {"status": "ok"}
+
+    @app.post("/reset")
+    async def reset(raw_request: Request):
+        ec = raw_request.app.state.engine_client
+        await ec.collective_rpc("reset_to_base_weights", args=())
+        return {"status": "ok"}
 
     return app
 

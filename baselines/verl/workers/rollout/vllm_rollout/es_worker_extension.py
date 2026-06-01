@@ -61,11 +61,10 @@ class WorkerExtension:
 
     def restore_self_weights(self, seed, SIGMA, negate=False):
         """Undo perturbation. Must use same negate value as perturb_self_weights."""
-        self._set_seed(seed)
         sign = -1.0 if negate else 1.0  # Same sign as perturb
         for _, p in self.model_runner.model.named_parameters():
             gen = torch.Generator(device=p.device)
-            gen.manual_seed(int(seed))
+            gen.manual_seed(int(self.local_seed))
             noise = torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=gen)
             # Undo: subtract what we added (sign * sigma * noise)
             p.data.add_(-sign * float(SIGMA) * noise)

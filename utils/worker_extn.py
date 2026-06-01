@@ -73,9 +73,9 @@ class WorkerExtension:
         for name, p in self.model_runner.model.named_parameters():
             gen = torch.Generator(device=p.device)
             gen.manual_seed(int(seed))
-            noise = torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=gen)
+            noise = torch.randn(p.shape, dtype=torch.float32, device=p.device, generator=gen)
             if self._should_perturb(name):
-                p.data.add_(sign * scale * noise)
+                p.data.add_((sign * scale * noise).to(p.dtype))
             del noise
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -89,10 +89,10 @@ class WorkerExtension:
         for name, p in self.model_runner.model.named_parameters():
             gen = torch.Generator(device=p.device)
             gen.manual_seed(int(seed))
-            noise = torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=gen)
+            noise = torch.randn(p.shape, dtype=torch.float32, device=p.device, generator=gen)
             if self._should_perturb(name):
                 # Undo: subtract what we added (sign * sigma * noise)
-                p.data.add_(-sign * float(SIGMA) * noise)
+                p.data.add_((-sign * float(SIGMA) * noise).to(p.dtype))
             del noise
         if torch.cuda.is_available():
             torch.cuda.synchronize()
