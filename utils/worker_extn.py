@@ -75,7 +75,7 @@ class WorkerExtension:
             gen.manual_seed(int(seed))
             noise = torch.randn(p.shape, dtype=torch.float32, device=p.device, generator=gen)
             if self._should_perturb(name):
-                p.data = (p.data.float() + sign * scale * noise).to(p.dtype)
+                p.data.copy_(p.data.float() + sign * scale * noise)
             del noise
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -92,7 +92,7 @@ class WorkerExtension:
             noise = torch.randn(p.shape, dtype=torch.float32, device=p.device, generator=gen)
             if self._should_perturb(name):
                 # Undo: subtract what we added (sign * sigma * noise)
-                p.data = (p.data.float() + (-sign * float(SIGMA) * noise)).to(p.dtype)
+                p.data.copy_(p.data.float() + (-sign * float(SIGMA) * noise))
             del noise
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -134,8 +134,7 @@ class WorkerExtension:
             # div by population_size multiply by alpha (scalar)
             update_accumulator.div_(population_size)
             update_accumulator.mul_(alpha)
-            # FP8 tensors have no math ops; upcast, apply, cast back
-            p.data = (p.data.float() + update_accumulator).to(p.dtype)
+            p.data.copy_(p.data.float() + update_accumulator)
             
             del update_accumulator
             param_count += 1
