@@ -75,7 +75,7 @@ class WorkerExtension:
             gen.manual_seed(int(seed))
             noise = torch.randn(p.shape, dtype=torch.float32, device=p.device, generator=gen)
             if self._should_perturb(name):
-                p.data.add_((sign * scale * noise).to(p.dtype))
+                p.data = (p.data.float() + sign * scale * noise).to(p.dtype)
             del noise
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -92,7 +92,7 @@ class WorkerExtension:
             noise = torch.randn(p.shape, dtype=torch.float32, device=p.device, generator=gen)
             if self._should_perturb(name):
                 # Undo: subtract what we added (sign * sigma * noise)
-                p.data.add_((-sign * float(SIGMA) * noise).to(p.dtype))
+                p.data = (p.data.float() + (-sign * float(SIGMA) * noise)).to(p.dtype)
             del noise
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -122,13 +122,7 @@ class WorkerExtension:
                 gen = torch.Generator(device=p.device)
                 gen.manual_seed(int(seed))
                 
-                # Generate noise (in native precision, usually float16/bfloat16)
-                noise = torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=gen)
-                
-                # FIXED: Convert noise to float32 BEFORE multiplication.
-                # Use in-place operation to avoid extra memory allocation
-                noise_fp32 = noise.to(torch.float32)
-                del noise  # Free original noise immediately
+                noise_fp32 = torch.randn(p.shape, dtype=torch.float32, device=p.device, generator=gen)
                 
                 # Scale in-place and accumulate
                 noise_fp32.mul_(coeffs[i])
@@ -140,8 +134,8 @@ class WorkerExtension:
             # div by population_size multiply by alpha (scalar)
             update_accumulator.div_(population_size)
             update_accumulator.mul_(alpha)
-            # Apply final update to weight (cast back to model dtype at the very end)
-            p.data.add_(update_accumulator.to(p.dtype))
+            # FP8 tensors have no math ops; upcast, apply, cast back
+            p.data = (p.data.float() + update_accumulator).to(p.dtype)
             
             del update_accumulator
             param_count += 1
