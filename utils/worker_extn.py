@@ -53,14 +53,26 @@ class WorkerExtension:
     # Prefixes of visual encoder parameters to skip during perturbation (for VL models)
     _VISUAL_PREFIXES = ("visual.", "model.visual.")
 
+    # Substrings identifying FP8 quantization scale parameters. These are tiny
+    # float32 tensors that scale whole weight blocks; additive Gaussian noise is a
+    # huge *relative* perturbation on them and corrupts the model at any usable
+    # sigma (while the FP8 weights themselves round small noise away). Never
+    # perturb them. Set PERTURB_SCALES=1 to override (not recommended).
+    _SCALE_MARKERS = ("scale_inv", "weight_scale", "input_scale", "act_scale", ".scale")
+
+    def _is_scale_param(self, name: str) -> bool:
+        return any(marker in name for marker in self._SCALE_MARKERS)
+
     def _should_perturb(self, name: str) -> bool:
         """Check if a parameter should be perturbed.
-        
-        By default, skips visual encoder params for VL models.
-        Set env PERTURB_VISUAL=1 to also perturb visual encoder.
+
+        Skips visual encoder params for VL models (PERTURB_VISUAL=1 to include),
+        and FP8 quantization scale params (PERTURB_SCALES=1 to include).
         """
+        if os.environ.get("PERTURB_SCALES", "0") != "1" and self._is_scale_param(name):
+            return False
         if os.environ.get("PERTURB_VISUAL", "0") == "1":
-            return True  # Perturb ALL parameters including visual encoder
+            return True  # Perturb ALL remaining parameters including visual encoder
         return not name.startswith(self._VISUAL_PREFIXES)
 
     def _set_seed(self, seed):
