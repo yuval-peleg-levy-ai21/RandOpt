@@ -8,3 +8,6 @@ ray[default]>=2.0.0
 pandas
 pyarrow
 tqdm
+safetensors
+ruamel.yaml
+fire
