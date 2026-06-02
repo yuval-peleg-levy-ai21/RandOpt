@@ -24,6 +24,22 @@ Example:
     --max-num-seqs 64
 """
 
+import os
+import sys
+
+# vLLM (>=~0.15 / nightly) forces 'spawn' for worker processes. Unlike 'fork',
+# a spawned worker re-execs Python and does NOT inherit the launcher's
+# sys.path[0] (this script's directory). It only sees PYTHONPATH. Without this,
+# resolving --worker-extension-cls utils.worker_extn.WorkerExtension fails in
+# the workers with ModuleNotFoundError: No module named 'utils.worker_extn'.
+# Propagate our own directory via PYTHONPATH so spawned workers can import it.
+_RANDOPT_DIR = os.path.dirname(os.path.abspath(__file__))
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    path for path in (_RANDOPT_DIR, os.environ.get("PYTHONPATH", "")) if path
+)
+if _RANDOPT_DIR not in sys.path:
+    sys.path.insert(0, _RANDOPT_DIR)
+
 import uvloop
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
