@@ -46,28 +46,25 @@ def _install_utils_next_to_vllm():
     if _RANDOPT_DIR not in sys.path:
         sys.path.insert(0, _RANDOPT_DIR)
 
-    import vllm
+    # Copy once, from the main API-server process, before any engine/worker is
+    # spawned. Spawned processes re-run this module as __mp_main__; they only
+    # need /randopt on sys.path (above) and must not race on the copy.
+    if __name__ == "__main__":
+        import vllm
 
-    vllm_site_dir = os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__)))
-    source_utils = os.path.join(_RANDOPT_DIR, "utils")
-    target_utils = os.path.join(vllm_site_dir, "utils")
-
-    print(
-        f"[randopt] __name__={__name__} pid={os.getpid()} exe={sys.executable} "
-        f"cwd={os.getcwd()}",
-        flush=True,
-    )
-    print(f"[randopt] vllm site dir: {vllm_site_dir}", flush=True)
-    print(f"[randopt] copying {source_utils} -> {target_utils}", flush=True)
-    shutil.copytree(source_utils, target_utils, dirs_exist_ok=True)
+        vllm_site_dir = os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__)))
+        target_utils = os.path.join(vllm_site_dir, "utils")
+        print(f"[randopt] copying {_RANDOPT_DIR}/utils -> {target_utils}", flush=True)
+        shutil.copytree(os.path.join(_RANDOPT_DIR, "utils"), target_utils, dirs_exist_ok=True)
 
     import importlib
 
     importlib.invalidate_caches()
-    import utils.worker_extn  # noqa: F401  verify it resolves from the default path
+    import utils.worker_extn  # noqa: F401  verify resolution in this process
 
     print(
-        f"[randopt] verified: import utils.worker_extn -> {utils.worker_extn.__file__}",
+        f"[randopt] pid={os.getpid()} {__name__}: "
+        f"utils.worker_extn -> {utils.worker_extn.__file__}",
         flush=True,
     )
 
