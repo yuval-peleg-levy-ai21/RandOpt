@@ -97,8 +97,10 @@ class RestoreRequest(BaseModel):
 _original_build_app = _api_server.build_app
 
 
-def _build_app_with_randopt_routes(args) -> FastAPI:
-    app = _original_build_app(args)
+# Forward *args/**kwargs: vLLM's build_app signature varies across versions
+# (nightly: build_app(args, supported_tasks=None, model_config=None)).
+def _build_app_with_randopt_routes(*args, **kwargs) -> FastAPI:
+    app = _original_build_app(*args, **kwargs)
 
     @app.post("/perturb")
     async def perturb(body: PerturbRequest, raw_request: Request):
