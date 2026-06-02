@@ -10,6 +10,13 @@ try:
 except ImportError:
     set_forward_context = None
 
+try:
+    # vLLM >= ~0.15 (nightly) moved get_ip into network_utils
+    from vllm.utils.network_utils import get_ip
+except ImportError:
+    # vLLM <= 0.14.x
+    from vllm.utils import get_ip
+
 def _stateless_init_process_group(master_address, master_port, rank, world_size, device):
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.utils import StatelessProcessGroup
@@ -151,7 +158,6 @@ class WorkerExtension:
 
     def get_worker_ip(self):
         """Return the IP address of this worker's node."""
-        from vllm.utils import get_ip
         return get_ip()
 
     def init_inter_engine_group(self, master_address: str, master_port: int, rank: int, world_size: int):
