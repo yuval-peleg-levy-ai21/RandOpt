@@ -25,20 +25,54 @@ Example:
 """
 
 import os
+import shutil
 import sys
 
-# vLLM (>=~0.15 / nightly) forces 'spawn' for worker processes. Unlike 'fork',
-# a spawned worker re-execs Python and does NOT inherit the launcher's
-# sys.path[0] (this script's directory). It only sees PYTHONPATH. Without this,
-# resolving --worker-extension-cls utils.worker_extn.WorkerExtension fails in
-# the workers with ModuleNotFoundError: No module named 'utils.worker_extn'.
-# Propagate our own directory via PYTHONPATH so spawned workers can import it.
 _RANDOPT_DIR = os.path.dirname(os.path.abspath(__file__))
-os.environ["PYTHONPATH"] = os.pathsep.join(
-    path for path in (_RANDOPT_DIR, os.environ.get("PYTHONPATH", "")) if path
-)
-if _RANDOPT_DIR not in sys.path:
-    sys.path.insert(0, _RANDOPT_DIR)
+
+
+def _install_utils_next_to_vllm():
+    """Make `utils.worker_extn` importable in vLLM worker processes.
+
+    Newer vLLM forces 'spawn' for workers AND launches the engine-core / worker
+    processes with a filtered environment, so neither the launcher's sys.path
+    nor a runtime PYTHONPATH reaches them -- resolving
+    --worker-extension-cls utils.worker_extn.WorkerExtension then fails with
+    ModuleNotFoundError. vLLM's own install directory is always on every
+    worker's import path (that is how they import vllm), so copying the package
+    there is reliable. This runs in the API-server process before any engine or
+    worker process is spawned.
+    """
+    if _RANDOPT_DIR not in sys.path:
+        sys.path.insert(0, _RANDOPT_DIR)
+
+    import vllm
+
+    vllm_site_dir = os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__)))
+    source_utils = os.path.join(_RANDOPT_DIR, "utils")
+    target_utils = os.path.join(vllm_site_dir, "utils")
+
+    print(
+        f"[randopt] __name__={__name__} pid={os.getpid()} exe={sys.executable} "
+        f"cwd={os.getcwd()}",
+        flush=True,
+    )
+    print(f"[randopt] vllm site dir: {vllm_site_dir}", flush=True)
+    print(f"[randopt] copying {source_utils} -> {target_utils}", flush=True)
+    shutil.copytree(source_utils, target_utils, dirs_exist_ok=True)
+
+    import importlib
+
+    importlib.invalidate_caches()
+    import utils.worker_extn  # noqa: F401  verify it resolves from the default path
+
+    print(
+        f"[randopt] verified: import utils.worker_extn -> {utils.worker_extn.__file__}",
+        flush=True,
+    )
+
+
+_install_utils_next_to_vllm()
 
 import uvloop
 from fastapi import FastAPI, Request
