@@ -12,15 +12,24 @@ OpenAI ``model`` field, e.g. ``model=seed7``).
 
 For every targeted linear layer (weight shape ``[out_features, in_features]``)
 we draw a *single* random vector of length ``rank * (in_features + out_features)``
-seeded deterministically from ``(seed, module_name)``, then split it into the
-two LoRA factors:
+from ``torch.randn`` seeded with ``int(seed)`` -- exactly as
+``es_worker_extension.WorkerExtension.perturb_self_weights`` seeds every parameter
+(``gen.manual_seed(int(seed))``, the same seed for all modules) -- then split it
+into the two LoRA factors:
 
     A = first  rank * in_features  values  -> reshape (rank, in_features)
     B = last   rank * out_features values  -> reshape (out_features, rank)
 
-The effective weight delta applied at inference is the PEFT-standard
-``(lora_alpha / rank) * (B @ A)``. The same ``(model, seed, rank, alpha)`` always
+Each factor is scaled by ``sqrt(noise_scale * sqrt(rank) / alpha)`` so the
+PEFT-applied delta ``(alpha / rank) * (B @ A)`` has per-element std ``noise_scale``
+-- the same magnitude as the ES perturbation ``noise_scale * N(0,1)``. The sqrt is
+because the delta is a *product* of two random factors, so each must carry the
+square root of the target scale (for the default rank=1, alpha=rank this is simply
+``sqrt(noise_scale)``). The same ``(model, seed, rank, alpha, noise_scale)`` always
 reproduces the same adapter.
+
+Note: mirroring the verl perturb, every module uses the same seed, so targeted
+layers with identical (in+out) dimensions receive identical factors.
 
 Given a path to an existing variant YAML and a seed count, this script:
   1. Reads the model identity (HF_MODEL_ID / weights.path) from the YAML.
@@ -35,9 +44,9 @@ Example:
         --variant_yaml ../algo-model-serving/helm/values/variant/qwen.yaml \\
         --num_seeds 20
 """
-
-import hashlib
+import fire
 import json
+import math
 import os
 import subprocess
 from typing import Optional
@@ -119,19 +128,17 @@ def _seed_lora_gcs_path(weights_path):
 
 
 def _lora_modules_value(adapter_names):
-    """Folded block scalar: 'seedN=/artifacts/<KEY>/seedN', one per line.
-
-    A folded scalar joins single newlines with spaces, so vLLM receives the
-    space-separated form it expects while every line stays well under yamllint's
-    400-char limit.
+    """Single-line space-separated 'seedN=/artifacts/<KEY>/seedN', as vLLM and
+    register_model.sh consume it directly. Note: with many seeds this line can
+    exceed yamllint's max-line-length (raise the limit / disable the rule for it).
     """
-    from ruamel.yaml.scalarstring import FoldedScalarString
+    from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
-    lines = "\n".join(f"{name}=/artifacts/{_ARTIFACT_KEY}/{name}" for name in adapter_names)
-    return FoldedScalarString(lines)
+    value = " ".join(f"{name}=/artifacts/{_ARTIFACT_KEY}/{name}" for name in adapter_names)
+    return DoubleQuotedScalarString(value)
 
 
-def _update_variant(models, adapter_names, gcs_artifact_path):
+def _update_variant(data, models, adapter_names, gcs_artifact_path):
     from ruamel.yaml.comments import CommentedMap
     from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
@@ -140,9 +147,27 @@ def _update_variant(models, adapter_names, gcs_artifact_path):
         weights["additionalArtifacts"] = CommentedMap()
     weights["additionalArtifacts"][_ARTIFACT_KEY] = gcs_artifact_path
 
-    env_vars = models["deployment"]["envVars"]
-    env_vars["ENABLE_LORA"] = DoubleQuotedScalarString("true")
-    env_vars["LORA_MODULES"] = _lora_modules_value(adapter_names)
+    # LORA_MODULES must reach two containers from two separate ConfigMaps: the
+    # per-model block feeds the vLLM container (--lora-modules), the top-level
+    # global block feeds the registration container (register_model.sh, which
+    # registers each adapter as a gateway endpoint). Anchor it once and alias it,
+    # matching the deepseek-ai-deepseek-ocr variant. ENABLE_LORA only needs the
+    # per-model block (the vLLM command), not registration.
+    lora_modules = _lora_modules_value(adapter_names)
+    lora_modules.yaml_set_anchor("LORA_MODULES", always_dump=True)
+
+    global_env = data["global"].setdefault("deployment", CommentedMap()).setdefault("envVars", CommentedMap())
+    global_env["LORA_MODULES"] = lora_modules
+    global_env["TOOL_SUPPORT"] = "true"
+    # The single-line value exceeds yamllint's max-line-length with many seeds.
+    global_env.yaml_add_eol_comment("# yamllint disable-line rule:line-length", "LORA_MODULES")
+
+    model_env = models["deployment"]["envVars"]
+    model_env["ENABLE_LORA"] = DoubleQuotedScalarString("true")
+    model_env["LORA_MODULES"] = lora_modules
+    model_env["TOOL_CALL_PARSER"] = "hermes"
+    model_env["ENABLE_AUTO_TOOL_CHOICE"] = "true"
+
 
 
 def _write_variant(yaml, data, path):
@@ -178,16 +203,17 @@ def _collect_target_linears(model, target_modules):
     return linears
 
 
-def _module_seed(base_seed, module_path):
-    """Derive a stable, distinct seed per module so layers get independent noise."""
-    digest = hashlib.sha256(f"{base_seed}:{module_path}".encode()).digest()
-    return int.from_bytes(digest[:8], "little")
+def _generate_lora_pair(out_features, in_features, rank, seed, factor, dtype):
+    """Draw one combined vector for this layer and split it into LoRA A and B.
 
-
-def _generate_lora_pair(out_features, in_features, rank, module_seed, dtype):
-    """Draw one combined vector for this layer and split it into LoRA A and B."""
-    generator = torch.Generator(device="cpu").manual_seed(module_seed)
+    Seeded with ``int(seed)`` exactly like perturb_self_weights
+    (``gen.manual_seed(int(seed))``) -- the same seed for every module. Each factor
+    is scaled by ``factor`` so the PEFT delta ``(alpha/rank)*(B@A)`` has per-element
+    std equal to the target ``noise_scale``.
+    """
+    generator = torch.Generator(device="cpu").manual_seed(int(seed))
     combined = torch.randn(rank * (in_features + out_features), generator=generator)
+    combined.mul_(factor)
 
     split_at = rank * in_features
     lora_a = combined[:split_at].reshape(rank, in_features).to(dtype)
@@ -195,12 +221,12 @@ def _generate_lora_pair(out_features, in_features, rank, module_seed, dtype):
     return lora_a, lora_b
 
 
-def _build_adapter_tensors(linears, base_seed, rank, dtype):
+def _build_adapter_tensors(linears, base_seed, rank, factor, dtype):
     """Build the PEFT-format state dict for all targeted layers for one seed."""
     tensors = {}
     for module_path, (out_features, in_features) in linears.items():
         lora_a, lora_b = _generate_lora_pair(
-            out_features, in_features, rank, _module_seed(base_seed, module_path), dtype
+            out_features, in_features, rank, base_seed, factor, dtype
         )
         key_prefix = f"base_model.model.{module_path}"
         tensors[f"{key_prefix}.lora_A.weight"] = lora_a
@@ -260,7 +286,7 @@ def _write_adapter(adapter_dir, tensors, adapter_config):
 
 
 def _generate_all_adapters(
-    config_source, model_name, target_modules, num_seeds, workdir, rank, alpha, dtype_arg, trust_remote_code
+    config_source, model_name, target_modules, num_seeds, workdir, rank, alpha, noise_scale, dtype_arg, trust_remote_code
 ):
     """Build the meta model once, then write one adapter per seed. Returns names."""
     config, model = _build_meta_model(config_source, trust_remote_code)
@@ -273,17 +299,25 @@ def _generate_all_adapters(
             "Inspect the model and pass --target_modules explicitly."
         )
 
+    # Per-factor std so the PEFT delta (alpha/rank)*(B@A) has per-element std ==
+    # noise_scale, matching perturb_self_weights' noise_scale * N(0,1). The sqrt is
+    # because the delta is a product of two random factors:
+    #   Var[(B@A)_ij] = rank * f**4  ->  std[delta] = (alpha/sqrt(rank)) * f**2.
+    factor = math.sqrt(noise_scale * math.sqrt(rank) / alpha)
+
     adapter_config = _build_adapter_config(model_name, target_modules, rank, alpha)
     adapter_names = []
     for seed in range(num_seeds):
         name = f"{_ADAPTER_PREFIX}{seed}"
-        tensors = _build_adapter_tensors(linears, seed, rank, dtype)
+        tensors = _build_adapter_tensors(linears, seed, rank, factor, dtype)
         _write_adapter(os.path.join(workdir, name), tensors, adapter_config)
         adapter_names.append(name)
 
     print(
         f"Generated {len(adapter_names)} adapters in {workdir}\n"
-        f"  rank={rank}  alpha={alpha}  scale={alpha / rank:.4g}\n"
+        f"  rank={rank}  alpha={alpha}  noise_scale={noise_scale:.4g}  "
+        f"factor(std of A,B)={factor:.4g}  (PEFT scale alpha/rank={alpha / rank:.4g})\n"
+        f"  effective per-weight delta std ~= {noise_scale:.4g}\n"
         f"  dtype={str(dtype).replace('torch.', '')}  layers={len(linears)}"
     )
     return adapter_names
@@ -302,7 +336,7 @@ def _default_output_yaml(input_path):
     return f"{root}-seedlora{ext}"
 
 
-def main(
+def make_lora_seeds(
     variant_yaml: str,
     num_seeds: int,
     workdir: str = "./seed_loras_build",
@@ -310,6 +344,7 @@ def main(
     model_path: Optional[str] = None,
     rank: int = 1,
     alpha: Optional[float] = None,
+    noise_scale: float = 1.0,
     target_modules=_DEFAULT_TARGET_MODULES,
     dtype: Optional[str] = None,
     trust_remote_code: bool = False,
@@ -324,7 +359,12 @@ def main(
         output_yaml: Where to write the updated YAML. Defaults to <input>-seedlora.yaml.
         model_path: Local model dir to read config.json from; falls back to HF_MODEL_ID.
         rank: LoRA rank.
-        alpha: LoRA alpha (effective scale = alpha/rank). Defaults to rank (scale 1.0).
+        alpha: LoRA alpha (PEFT scaling alpha/rank). The factor magnitude compensates
+            for it, so it cancels out of the effective delta std. Defaults to rank.
+        noise_scale: Target per-element std of the weight delta, matching
+            es_worker_extension.perturb_self_weights's noise_scale. Each LoRA factor
+            is drawn at std sqrt(noise_scale * sqrt(rank) / alpha) (= sqrt(noise_scale)
+            for the default rank=1, alpha=rank), since the delta is a product B@A.
         target_modules: Linear module leaf names to perturb.
         dtype: Adapter tensor dtype (bfloat16/float16/float32). Defaults to the model's.
         trust_remote_code: Allow loading custom modeling code for non-standard architectures.
@@ -334,6 +374,8 @@ def main(
         raise SystemExit("--rank must be >= 1")
     if num_seeds < 1:
         raise SystemExit("--num_seeds must be >= 1")
+    if noise_scale <= 0:
+        raise SystemExit("--noise_scale must be > 0")
     if dtype is not None and dtype not in _DTYPES:
         raise SystemExit(f"--dtype must be one of {sorted(_DTYPES)}")
     alpha = float(alpha) if alpha is not None else float(rank)
@@ -348,7 +390,7 @@ def main(
 
     config_source = _resolve_config_source(model_path, hf_model_id)
     adapter_names = _generate_all_adapters(
-        config_source, hf_model_id, list(target_modules), num_seeds, workdir, rank, alpha, dtype, trust_remote_code
+        config_source, hf_model_id, list(target_modules), num_seeds, workdir, rank, alpha, noise_scale, dtype, trust_remote_code
     )
 
     if no_upload:
@@ -356,7 +398,7 @@ def main(
     else:
         _upload_to_gcs(workdir, adapter_names, gcs_artifact_path)
 
-    _update_variant(models, adapter_names, gcs_artifact_path)
+    _update_variant(data, models, adapter_names, gcs_artifact_path)
     output_yaml = output_yaml or _default_output_yaml(variant_yaml)
     _write_variant(yaml, data, output_yaml)
 
@@ -370,6 +412,4 @@ def main(
 
 
 if __name__ == "__main__":
-    import fire
-
-    fire.Fire(main)
+    fire.Fire(make_lora_seeds)
